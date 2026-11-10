@@ -1,0 +1,7 @@
+{
+  "devicetype":"mouse",
+  "version":1,
+  "bindings":[
+    {"action":"xFpHookLink_click", "control":"button0"}
+  ]
+}

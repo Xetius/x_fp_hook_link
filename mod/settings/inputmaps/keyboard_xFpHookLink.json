@@ -1,0 +1,8 @@
+{
+  "devicetype":"keyboard",
+  "version":1,
+  "bindings":[
+    {"action":"xFpHookLink_mode",       "control":"ctrl alt shift h"},
+    {"action":"xFpHookLink_releaseAll", "control":"ctrl alt shift j"}
+  ]
+}

@@ -1,0 +1,43 @@
+name: Release
+
+# Push a semver tag without a v prefix (e.g. 1.0.0 or 1.1.0-beta.1) to build x_fp_hook_link_<version>.zip
+# and publish it as a GitHub release. Pre-release tags are published as pre-releases.
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag is semver
+        run: |
+          if ! [[ "$GITHUB_REF_NAME" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '$GITHUB_REF_NAME' is not semver X.Y.Z (no v prefix)"
+            exit 1
+          fi
+
+      - name: Build mod zip
+        run: |
+          zip_name="x_fp_hook_link_${GITHUB_REF_NAME}.zip"
+          # The contents of mod/ (lua, scripts, settings) at the root of the zip, as BeamNG expects.
+          (cd mod && zip -r -X "../$zip_name" .)
+          unzip -l "$zip_name"
+          echo "ZIP_NAME=$zip_name" >> "$GITHUB_ENV"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=""
+          [[ "$GITHUB_REF_NAME" == *-* ]] && prerelease="--prerelease"
+          gh release create "$GITHUB_REF_NAME" "$ZIP_NAME" \
+            --title "x_fp_hook_link $GITHUB_REF_NAME" \
+            --generate-notes $prerelease

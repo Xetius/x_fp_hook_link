@@ -1,0 +1,5 @@
+{
+  "xFpHookLink_mode":       {"cat": "xFpHookLink", "order": 1, "ctx": "tlua", "onDown": "if extensions.xFpHookLink_main then extensions.xFpHookLink_main.toggleMode() end", "title": "Hook mode on/off", "desc": "Show the FunPhysics hooks so one can be clicked and linked to another vehicle"},
+  "xFpHookLink_click":      {"cat": "xFpHookLink", "order": 2, "ctx": "tlua", "actionMap": "VehicleCommon", "onDown": "if extensions.xFpHookLink_main then extensions.xFpHookLink_main.click() end", "title": "Hook mode: select", "desc": "In hook mode, choose the hook or vehicle point under the cursor (does nothing outside hook mode)"},
+  "xFpHookLink_releaseAll": {"cat": "xFpHookLink", "order": 3, "ctx": "tlua", "onDown": "if extensions.xFpHookLink_main then extensions.xFpHookLink_main.releaseAll() end", "title": "Release hooks", "desc": "Release every hook link on the vehicle you are driving (or all links if it has none)"}
+}
