@@ -3,6 +3,7 @@
   "version":1,
   "bindings":[
     {"action":"xFpHookLink_mode",       "control":"ctrl alt shift h"},
+    {"action":"xFpHookLink_ropeMode",   "control":"ctrl alt shift k"},
     {"action":"xFpHookLink_releaseAll", "control":"ctrl alt shift j"}
   ]
 }

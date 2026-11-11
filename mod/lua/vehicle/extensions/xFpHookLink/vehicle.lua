@@ -234,6 +234,199 @@ local function steer(hookCid, hook, dt, wantedSpeed)
   return dist
 end
 
+-- Ropes ---------------------------------------------------------------------------------------------
+-- A rope joins a node on the hook's vehicle to a node on another vehicle (the load). It has a fixed length
+-- and only pulls: slack, it does nothing; stretched past its length, tension = stiffness * stretch +
+-- damping * stretch rate. Both ends run this same code in their own vehicle and apply the tension to
+-- their own end, so each vehicle feels the other.
+--
+-- Each vehicle knows its own nodes exactly at physics rate (2 kHz), but hears where the other end is only
+-- once per graphics frame, and the frame rate isn't fixed: when the game loses focus it drops to a few
+-- frames a second while physics carries on. The first version predicted the far end's motion between
+-- frames and damped against its last reported velocity; across those long gaps that pumped energy into
+-- the ropes and shook both vehicles apart. So each end treats the far end as fixed where it was last
+-- reported: between reports it hangs on a spring and damper to a fixed point, which can only lose
+-- energy. A little damping across the rope as well stops the load swinging up through the stale reports.
+-- When a report is overdue (the frame rate has dropped) both dampings go up, so a heavy load can't build
+-- up a bounce between reports. The two vehicles tell each other where their ends are directly, once per
+-- frame.
+local ropes = {}            -- rope id -> rope
+local ropeCount = 0
+local physicsHooked = false
+local sideDamping = 1500    -- N per m/s across each rope
+local staleAfter = 0.04     -- s without a report from the far end before the stale damping applies
+local staleDampingFactor = 3  -- along the rope, times the normal damping
+local staleSideDamping = 6000 -- N per m/s across each rope
+local tensionReportInterval = 0.25
+local maxSpreadNodes = 8
+
+-- The nodes a rope end pulls on, with their masses. On the hook side, the hook body (so the hook moves as
+-- one piece); on the other side, the tow node and the nodes beamed straight to it, so a heavy load isn't
+-- hung off a single node. Shared by mass, so they all accelerate together and no beam is strained by it.
+local neighbourMap
+local function spreadNodes(cid, isHook)
+  local cids = {}
+  if isHook then
+    local body = hookBody(cid)
+    for _, n in ipairs(body) do cids[#cids + 1] = n.cid end
+  else
+    cids[1] = cid
+    if not neighbourMap then
+      neighbourMap = {}
+      for _, b in pairs(v.data.beams or {}) do
+        local a, c = b.id1, b.id2
+        if a ~= nil and c ~= nil then
+          neighbourMap[a] = neighbourMap[a] or {}
+          neighbourMap[c] = neighbourMap[c] or {}
+          table.insert(neighbourMap[a], c)
+          table.insert(neighbourMap[c], a)
+        end
+      end
+    end
+    local seen = {[cid] = true}
+    for _, other in ipairs(neighbourMap[cid] or {}) do
+      local node = v.data.nodes[other]
+      if not seen[other] and node and node.wheelID == nil and #cids < maxSpreadNodes then
+        seen[other] = true
+        cids[#cids + 1] = other
+      end
+    end
+  end
+  local list, mass = {}, 0
+  for _, c in ipairs(cids) do
+    local m = obj:getNodeMass(c) or 0
+    if m > 0 then
+      list[#list + 1] = {cid = c, share = m}
+      mass = mass + m
+    end
+  end
+  if mass <= 0 then return {{cid = cid, share = 1}}, 1 end
+  for _, n in ipairs(list) do n.share = n.share / mass end
+  return list, mass
+end
+
+-- id: rope id from GE; cid: this vehicle's end; length: rope length in m; isHook: 1 on the hook's vehicle;
+-- farId: the other vehicle; x, y, z: where the far end is now.
+-- How many ropes pull on each rope end node: the damping limit for a node is shared between them.
+local function recountShared()
+  local perCid = {}
+  for _, r in pairs(ropes) do perCid[r.cid] = (perCid[r.cid] or 0) + 1 end
+  for _, r in pairs(ropes) do r.shared = perCid[r.cid] end
+end
+
+function M.ropeAdd(id, cid, length, stiffness, damping, maxTension, isHook, farId, x, y, z)
+  id, cid = tonumber(id), tonumber(cid)
+  if not id or not cid or not v.data.nodes[cid] then return end
+  if ropes[id] then ropeCount = ropeCount - 1 end
+  local hookEnd = tonumber(isHook) == 1
+  local nodes, mass = spreadNodes(cid, hookEnd)
+  ropes[id] = {
+    farId = tonumber(farId),
+    cid = cid, nodes = nodes, mass = mass,
+    length = tonumber(length) or 1,
+    stiffness = tonumber(stiffness) or 400000,
+    damping = tonumber(damping) or 20000,
+    maxTension = tonumber(maxTension) or 250000,
+    isHook = hookEnd,
+    tension = 0, reportTimer = 0,
+    rx = tonumber(x), ry = tonumber(y), rz = tonumber(z), -- the far end, as last reported
+    age = 0,                                              -- s since the far end last reported
+  }
+  ropeCount = ropeCount + 1
+  recountShared()
+  if not physicsHooked and enablePhysicsStepHook then
+    enablePhysicsStepHook()
+    physicsHooked = true
+  end
+  log("I", logTag, string.format("rope %d %s end on node %d: %.2f m, %d nodes, %.1f kg", id, hookEnd and "hook" or "load",
+    cid, ropes[id].length, #nodes, mass))
+end
+
+-- Where the far end of rope id is, in world coordinates. The other vehicle sends this every frame.
+function M.ropeRemote(id, x, y, z)
+  local r = ropes[tonumber(id)]
+  if not r then return end
+  r.rx, r.ry, r.rz = tonumber(x) or 0, tonumber(y) or 0, tonumber(z) or 0
+  r.age = 0
+end
+
+function M.ropeSetLength(id, length)
+  local r = ropes[tonumber(id)]
+  if r and tonumber(length) then r.length = math.max(tonumber(length), 0.05) end
+end
+
+function M.ropeRemove(id)
+  id = tonumber(id)
+  if ropes[id] then
+    ropes[id] = nil
+    ropeCount = ropeCount - 1
+    recountShared()
+  end
+end
+
+function M.ropeRemoveAll()
+  ropes, ropeCount = {}, 0
+end
+
+function M.getRope(id) return ropes[tonumber(id)] end
+
+local function ropeStep(r, dt)
+  r.age = r.age + dt
+  if not r.rx then return end
+  local lp = obj:getPosition() + obj:getNodePosition(r.cid)
+  local dx, dy, dz = r.rx - lp.x, r.ry - lp.y, r.rz - lp.z
+  local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+  if dist <= r.length or dist < 1e-3 then
+    r.tension = 0
+    return
+  end
+  dx, dy, dz = dx / dist, dy / dist, dz / dist
+  local lv = obj:getNodeVelocityVector(r.cid)
+  local along = lv.x * dx + lv.y * dy + lv.z * dz -- towards the far end
+  local stale = r.age > staleAfter
+  -- explicit integration: all the damping on these nodes must stay within what their mass can take in
+  -- one step, so the limit is shared between the ropes on this node (along and across are at right angles)
+  local maxDamping = 0.5 * r.mass / (dt * (r.shared or 1))
+  local damping = math.min(r.damping * (stale and staleDampingFactor or 1), maxDamping)
+  local t = r.stiffness * (dist - r.length) - damping * along
+  if t < 0 then t = 0 elseif t > r.maxTension then t = r.maxTension end
+  r.tension = t
+  if t <= 0 then return end
+  local c = math.min(stale and staleSideDamping or sideDamping, maxDamping)
+  local fx = dx * t - (lv.x - along * dx) * c
+  local fy = dy * t - (lv.y - along * dy) * c
+  local fz = dz * t - (lv.z - along * dz) * c
+  for _, n in ipairs(r.nodes) do
+    local sh = n.share
+    obj:applyForceVector(n.cid, vec3(fx * sh, fy * sh, fz * sh))
+  end
+end
+
+local function onPhysicsStep(dt)
+  if ropeCount == 0 then return end
+  for _, r in pairs(ropes) do ropeStep(r, dt) end
+end
+
+-- Once per frame each end tells the other vehicle where it is. The hook end also reports the tension to
+-- GE for the markers.
+local function ropeReports(dt)
+  for id, r in pairs(ropes) do
+    local p = obj:getPosition() + obj:getNodePosition(r.cid)
+    local x, y, z = p.x, p.y, p.z
+    if r.farId then
+      obj:queueObjectLuaCommand(r.farId, string.format(
+        "if extensions.xFpHookLink_vehicle then extensions.xFpHookLink_vehicle.ropeRemote(%d,%.4f,%.4f,%.4f) end", id, x, y, z))
+    end
+    if r.isHook then
+      r.reportTimer = r.reportTimer + dt
+      if r.reportTimer >= tensionReportInterval then
+        r.reportTimer = 0
+        obj:queueGameEngineLua(string.format("if extensions.xFpHookLink_main then extensions.xFpHookLink_main.onRopeTension(%d,%.0f) end", id, r.tension))
+      end
+    end
+  end
+end
+
 local function onCouplerAttached(nodeId, obj2id, obj2nodeId)
   local hook = hooks[nodeId]
   if not hook or hook.phase ~= "latching" then return end
@@ -252,6 +445,7 @@ end
 
 local function updateGFX(dt)
   if dt <= 0 then return end
+  if ropeCount > 0 then ropeReports(dt) end
   for hookCid, hook in pairs(hooks) do
     if hook.target and hook.phase ~= "held" then
       local dist = steer(hookCid, hook, dt, hook.phase == "latching" and 0.2 or approachSpeed)
@@ -267,16 +461,20 @@ end
 
 local function onReset()
   hooks = {}
+  ropes, ropeCount = {}, 0
+  neighbourMap = nil
 end
 
 local function onExtensionUnloaded()
   for hookCid in pairs(hooks) do obj:detachCoupler(hookCid, 0) end
   hooks = {}
+  ropes, ropeCount = {}, 0
 end
 
 M.onCouplerAttached = onCouplerAttached
 M.onCouplerDetached = onCouplerDetached
 M.updateGFX = updateGFX
+M.onPhysicsStep = onPhysicsStep
 M.onReset = onReset
 M.onExtensionUnloaded = onExtensionUnloaded
 

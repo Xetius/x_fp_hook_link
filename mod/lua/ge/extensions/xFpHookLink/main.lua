@@ -4,7 +4,12 @@
 -- "crane_hook", e.g. the MPL60's green and blue winch hooks). Click a hook, then click a point on another
 -- vehicle. A small force on the hook alone steers it to that node (the other vehicle feels nothing); when
 -- it touches, a strong coupler locks it there. Clicking a hook that is already linked releases it.
--- Ctrl+Alt+Shift+J releases every link on the vehicle you are driving.
+-- Ctrl+Alt+Shift+J releases every link and rope on the vehicle you are driving.
+--
+-- Rope mode (Ctrl+Alt+Shift+K): click a hook, then click tow points on another vehicle. Each click adds a
+-- rope from that hook node to the point, at the length it is now, like slinging a load. Reeling the hook in
+-- lifts the vehicle on its ropes. Clicking a roped point again removes that rope. The ropes are simulated
+-- in both vehicles' Lua at physics rate (see xFpHookLink_vehicle), which tell each other where they are.
 -- The steering and locking happen on the hook's own vehicle in xFpHookLink_vehicle; this side sends it
 -- the target node's position every frame.
 local M = {}
@@ -21,6 +26,9 @@ local progressStep = 0.05       -- m the hook must close to count as progress
 local hookPickRadius = 0.35
 local hookMarkerRadius = 0.18
 local nodeMarkerRadius = 0.08
+local ropeStiffness = 400000    -- N/m per rope (a 1.5 t car on 4 ropes stretches them about 1 cm)
+local ropeDamping = 20000       -- N per m/s of stretch rate (each end caps it to what its nodes can take)
+local ropeMaxTension = 250000   -- N per rope; tension is capped here, the rope doesn't break
 
 local hookLabels = {
   winch1_l55 = "Green hook",
@@ -42,10 +50,13 @@ local tagColors = {
 -- State -------------------------------------------------------------------------------------------
 
 local mode            -- nil, "pickHook" or "pickTarget"
+local tool = "hook"   -- "hook": steer the hook onto one point; "rope": add ropes from the hook to points
 local selectedHook    -- {vehId, cid, label, name}
 local hovered         -- hook marker or node pick under the cursor
 local visibleHooks = {}
 local links = {}      -- "vehId:cid" -> link
+local ropes = {}      -- rope id -> rope
+local nextRopeId = 1
 local vehCache = {}
 local now = 0
 
@@ -174,6 +185,74 @@ local function startLink(hook, targetVeh, targetCid, targetName)
   }
   vehCmd(hook.vehId, string.format("attach(%d,%d,%d,%d)", hook.cid, targetVeh:getID(), targetCid, holdStrength))
   message(string.format("%s: moving to %s. Reel out if it stops short.", hook.label, targetName))
+end
+
+-- Ropes -------------------------------------------------------------------------------------------
+
+local function ropeBetween(hookVehId, hookCid, targetId, targetCid)
+  for id, r in pairs(ropes) do
+    if r.hookVehId == hookVehId and r.hookCid == hookCid and r.targetId == targetId and r.targetCid == targetCid then
+      return id, r
+    end
+  end
+end
+
+local function ropesOnHook(hookVehId, hookCid)
+  local n = 0
+  for _, r in pairs(ropes) do
+    if r.hookVehId == hookVehId and r.hookCid == hookCid then n = n + 1 end
+  end
+  return n
+end
+
+local function plural(n, word) return string.format("%d %s%s", n, word, n == 1 and "" or "s") end
+
+local function removeRope(id, sendHook, sendTarget)
+  local r = ropes[id]
+  if not r then return end
+  ropes[id] = nil
+  if sendHook ~= false then vehCmd(r.hookVehId, string.format("ropeRemove(%d)", id)) end
+  if sendTarget ~= false then vehCmd(r.targetId, string.format("ropeRemove(%d)", id)) end
+end
+
+local function addRope(hook, targetVeh, targetCid, targetLabel)
+  local hookVeh = getObjectByID(hook.vehId)
+  if not hookVeh then return end
+  local length = nodeWorld(hookVeh, hook.cid):distance(nodeWorld(targetVeh, targetCid))
+  if length > maxHookRange then
+    message(string.format("That point is %.0f m from %s; ropes can be at most %d m.", length, hook.label, maxHookRange))
+    return
+  end
+  local id = nextRopeId
+  nextRopeId = nextRopeId + 1
+  local targetId = targetVeh:getID()
+  ropes[id] = {
+    hookVehId = hook.vehId, hookCid = hook.cid, label = hook.label,
+    targetId = targetId, targetCid = targetCid, targetLabel = targetLabel,
+    length = length, tension = 0, dist = length,
+  }
+  local args = string.format("%.4f,%.0f,%.0f,%.0f", length, ropeStiffness, ropeDamping, ropeMaxTension)
+  local hp, tp = nodeWorld(hookVeh, hook.cid), nodeWorld(targetVeh, targetCid)
+  vehCmd(hook.vehId, string.format("ropeAdd(%d,%d,%s,1,%d,%.4f,%.4f,%.4f)", id, hook.cid, args, targetId, tp.x, tp.y, tp.z))
+  vehCmd(targetId, string.format("ropeAdd(%d,%d,%s,0,%d,%.4f,%.4f,%.4f)", id, targetCid, args, hook.vehId, hp.x, hp.y, hp.z))
+  message(string.format("Rope from %s to %s (%.1f m). %s on this hook.", hook.label, targetLabel, length,
+    plural(ropesOnHook(hook.vehId, hook.cid), "rope")))
+end
+
+-- The two ends tell each other where they are (xFpHookLink_vehicle); this only drops ropes whose vehicle
+-- has gone and keeps the length for the markers.
+local function updateRopes()
+  for id, r in pairs(ropes) do
+    local hv, tv = getObjectByID(r.hookVehId), getObjectByID(r.targetId)
+    if not hv or not tv then
+      removeRope(id, hv ~= nil, tv ~= nil)
+    else
+      local hx, hy, hz = hv:getNodeAbsPositionXYZ(r.hookCid)
+      local tx, ty, tz = tv:getNodeAbsPositionXYZ(r.targetCid)
+      local dx, dy, dz = tx - hx, ty - hy, tz - hz
+      r.dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+    end
+  end
 end
 
 -- Picking -----------------------------------------------------------------------------------------
@@ -369,6 +448,25 @@ local function drawLinks()
   end
 end
 
+local function drawRopes()
+  for _, r in pairs(ropes) do
+    local hv, tv = getObjectByID(r.hookVehId), getObjectByID(r.targetId)
+    if hv and tv then
+      local a, b = nodeWorld(hv, r.hookCid), nodeWorld(tv, r.targetCid)
+      local c
+      if (r.dist or 0) <= r.length then
+        c = color(0.75, 0.75, 0.75, 0.9) -- slack
+      else
+        local load = math.min((r.tension or 0) / ropeMaxTension, 1)
+        c = color(0.2 + 0.8 * load, 1 - 0.7 * load, 0.2, 1)
+      end
+      debugDrawer:drawLine(a, b, c)
+      debugDrawer:drawSphere(b, nodeMarkerRadius, c, false)
+      if mode then drawText((a + b) * 0.5, string.format("%.1f kN", (r.tension or 0) / 1000)) end
+    end
+  end
+end
+
 local function drawSelection()
   local hoverColor = color(1, 0.9, 0.2, 1)
   for _, hook in ipairs(visibleHooks) do
@@ -379,7 +477,12 @@ local function drawSelection()
     debugDrawer:drawSphere(hook.pos, hookMarkerRadius, c, false)
   end
   if mode == "pickHook" and hovered then
-    local action = linkFor(hovered.vehId, hovered.cid) and "click to release" or "click to choose"
+    local action = "click to choose"
+    if tool == "hook" and linkFor(hovered.vehId, hovered.cid) then action = "click to release" end
+    if tool == "rope" then
+      local n = ropesOnHook(hovered.vehId, hovered.cid)
+      action = n > 0 and (plural(n, "rope") .. " - click to add or remove") or "click to add ropes"
+    end
     drawText(hovered.pos + vec3(0, 0, 0.4), hovered.label .. " - " .. action)
   elseif mode == "pickTarget" and selectedHook then
     for _, tp in ipairs(visibleTowPoints) do
@@ -391,7 +494,12 @@ local function drawSelection()
       local dist = hookPos:distance(hovered.pos)
       debugDrawer:drawSphere(hovered.pos, towPointRadius * 1.3, hoverColor, false)
       debugDrawer:drawLine(hookPos, hovered.pos, dist <= maxHookRange and hoverColor or color(1, 0.25, 0.2, 1))
-      drawText(hovered.pos + vec3(0, 0, 0.3), string.format("%s (%.1f m)", hovered.label, dist))
+      local suffix = ""
+      if tool == "rope" then
+        suffix = ropeBetween(selectedHook.vehId, selectedHook.cid, hovered.veh:getID(), hovered.cid)
+          and " - click to remove rope" or " - click to add rope"
+      end
+      drawText(hovered.pos + vec3(0, 0, 0.3), string.format("%s (%.1f m)%s", hovered.label, dist, suffix))
     end
   end
 end
@@ -436,6 +544,11 @@ function M.onHookHeld(vehId, hookCid)
   message(string.format("%s attached to %s. Reel in to pull.", l.label, l.targetName))
 end
 
+function M.onRopeTension(id, tension)
+  local r = ropes[tonumber(id)]
+  if r then r.tension = tonumber(tension) or 0 end
+end
+
 function M.onHookBroke(vehId, hookCid)
   local key = linkKey(vehId, hookCid)
   local l = links[key]
@@ -446,18 +559,45 @@ end
 
 -- Public: input actions ---------------------------------------------------------------------------
 
-function M.toggleMode()
-  if mode then
+local function setTool(newTool)
+  if mode and tool == newTool then
     mode, selectedHook, hovered = nil, nil, nil
-    message("Hook mode off.")
+    message(newTool == "rope" and "Rope mode off." or "Hook mode off.")
+    return
+  end
+  tool, mode, selectedHook, hovered = newTool, "pickHook", nil, nil
+  if newTool == "rope" then
+    message("Rope mode: click a hook, then click tow points to add ropes from it (click a roped point to remove its rope). Ctrl+Alt+Shift+K to exit.")
   else
-    mode = "pickHook"
     message("Hook mode: click a hook to choose it (or a linked hook to release it). Ctrl+Alt+Shift+H to exit.")
   end
 end
 
+function M.toggleMode() setTool("hook") end
+function M.toggleRopeMode() setTool("rope") end
+
 function M.click()
   if not mode then return end
+  if tool == "rope" then
+    if not hovered then return end
+    if mode == "pickHook" then
+      selectedHook, mode = hovered, "pickTarget"
+      message(selectedHook.label .. " chosen. Click tow points to add ropes; click the hook again when done.")
+    elseif hovered.kind == "node" then
+      local id = ropeBetween(selectedHook.vehId, selectedHook.cid, hovered.veh:getID(), hovered.cid)
+      if id then
+        removeRope(id)
+        message(string.format("Rope to %s removed. %s left on %s.", hovered.label,
+          plural(ropesOnHook(selectedHook.vehId, selectedHook.cid), "rope"), selectedHook.label))
+      else
+        addRope(selectedHook, hovered.veh, hovered.cid, hovered.label)
+      end
+    else
+      message(string.format("%s done: %s.", selectedHook.label, plural(ropesOnHook(selectedHook.vehId, selectedHook.cid), "rope")))
+      selectedHook, mode = nil, "pickHook"
+    end
+    return
+  end
   if mode == "pickHook" then
     if not hovered then return end
     if linkFor(hovered.vehId, hovered.cid) then
@@ -488,16 +628,32 @@ function M.releaseAll()
       released = released + 1
     end
   end
-  if released == 0 then
+  local cut = 0
+  for id, r in pairs(ropes) do
+    if r.hookVehId == playerId or r.targetId == playerId then
+      removeRope(id)
+      cut = cut + 1
+    end
+  end
+  if released == 0 and cut == 0 then
     for key in pairs(links) do
       removeLink(key, true)
       released = released + 1
     end
+    for id in pairs(ropes) do
+      removeRope(id)
+      cut = cut + 1
+    end
   end
-  message(released == 0 and "No hooks are linked." or string.format("Released %d hook link%s.", released, released == 1 and "" or "s"))
+  if released == 0 and cut == 0 then
+    message("No hooks are linked.")
+  else
+    message(string.format("Released %s and %s.", plural(released, "hook link"), plural(cut, "rope")))
+  end
 end
 
 function M.getLinks() return links end
+function M.getRopes() return ropes end
 function M.getTowPoints(vehId)
   local veh = getObjectByID(vehId)
   local c = veh and getCache(veh)
@@ -509,7 +665,9 @@ end
 local function onUpdate(dtReal)
   now = now + (dtReal or 0)
   updateLinks()
+  updateRopes()
   if next(links) then drawLinks() end
+  if next(ropes) then drawRopes() end
   if not mode then return end
 
   hovered = nil
@@ -546,6 +704,12 @@ local function forgetVehicle(vehId)
       removeLink(key, l.hookVehId ~= vehId)
     end
   end
+  for id, r in pairs(ropes) do
+    -- the vehicle that changed has dropped its own ropes; tell the other end
+    if r.hookVehId == vehId or r.targetId == vehId then
+      removeRope(id, r.hookVehId ~= vehId, r.targetId ~= vehId)
+    end
+  end
   if selectedHook and selectedHook.vehId == vehId then
     selectedHook = nil
     if mode then mode = "pickHook" end
@@ -557,7 +721,7 @@ M.onVehicleDestroyed = forgetVehicle
 M.onVehicleResetted = forgetVehicle
 M.onVehicleSpawned = forgetVehicle
 M.onClientEndMission = function()
-  links, vehCache, mode, selectedHook, hovered = {}, {}, nil, nil, nil
+  links, ropes, vehCache, mode, selectedHook, hovered = {}, {}, {}, nil, nil, nil
 end
 
 return M
