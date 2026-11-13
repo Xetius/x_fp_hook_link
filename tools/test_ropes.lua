@@ -5,7 +5,8 @@
 -- each other where their rope ends are once per graphics frame, as in game. Then the frame rate drops to a
 -- background rate (the game losing focus) while physics carries on, and everything must stay calm.
 -- Knobs: ROPE_LAG (extra frames of message delay, default 2), ROPE_CAR_KG, ROPE_BG_FPS (default 5),
--- ROPE_CABLE_K, ROPE_HOOK_KG, ROPE_TRACE (print the first n seconds of the background phase).
+-- ROPE_CABLE_K, ROPE_HOOK_KG, ROPE_TRACE (print the first n seconds of the background phase),
+-- ROPE_TRACE_REEL (print the reel-in every 10 frames).
 
 local failures = 0
 local function check(cond, what)
@@ -189,6 +190,8 @@ local cableK, cableC = tonumber(os.getenv("ROPE_CABLE_K") or "2e6"), 2000
 local hookBody = {10, 13, 14}
 local dtPhys = 0.0005
 local maxCarSpeed, maxHookSpeed = 0, 0
+local stuckForce = 0 -- N holding the car down while it sits on the ground (mud), until it is pulled free
+local carPinned = false -- the car doesn't move at all
 
 local function physicsStep(dt)
   exts[1].onPhysicsStep(dt)
@@ -217,11 +220,12 @@ local function physicsStep(dt)
   -- car: rigid body on a ground spring
   local cf = vec3(0, 0, -carMass * G)
   for _, fv in pairs(forces[2]) do cf = cf + fv end
+  if carOffset.z < 0.03 then cf.z = cf.z - stuckForce end
   if carOffset.z < 0 then
     cf.z = cf.z + 4e6 * (-carOffset.z) - 2e5 * math.min(carVel.z, 0)
     cf.x, cf.y = cf.x - 5000 * carVel.x, cf.y - 5000 * carVel.y
   end
-  carVel = carVel + cf * (dt / carMass)
+  carVel = carPinned and vec3(0, 0, 0) or carVel + cf * (dt / carMass)
   carOffset = carOffset + carVel * dt
   maxCarSpeed = math.max(maxCarSpeed, carVel:length())
   forces[1], forces[2] = {}, {}
@@ -304,8 +308,47 @@ check(messages[#messages]:find("done: 4 ropes") ~= nil, "clicking the hook again
 for _ = 1, 30 do frame() end
 check(math.abs(carOffset.z - groundZ) < 0.005, "slack ropes leave the car on the ground")
 
--- Reel in: the car comes up ------------------------------------------------------------------------
-for _ = 1, 60 * 5 do frame(0.5) end -- 2.5 m of cable
+-- Reel in: the car is stuck in mud (100 kN holding it down, about 8 times its weight). The winch pulls
+-- until the ropes carry 80 kN and stops there for 2 s, as a player would while working it free: steel rope
+-- shouldn't visibly stretch while it holds (the car is pinned meanwhile, so the ropes taking up their
+-- stretch can't pull it free). Then it carries on until the car comes free and lifts.
+stuckForce = 100000
+local function ropeTotals()
+  local total, stretch = 0, 0
+  for id in pairs(ge.getRopes()) do
+    local r = exts[2].getRope(id)
+    total = total + (r.tension or 0)
+    if (r.tension or 0) > 5000 then stretch = math.max(stretch, r.stretch or 0) end
+  end
+  return total, stretch
+end
+local reeled, maxTension, freedAt, heldStretch = 0, 0, nil, nil
+while reeled < 60 * 5 do
+  frame(0.5) -- 2.5 m of cable in all
+  reeled = reeled + 1
+  local total = ropeTotals()
+  maxTension = math.max(maxTension, total)
+  if not heldStretch and total > 80000 then
+    local sum, n = 0, 0
+    carPinned = true
+    for i = 1, 120 do
+      frame(0)
+      local t, st = ropeTotals()
+      if i > 90 then sum, n = sum + st, n + 1 end
+    end
+    carPinned = false
+    heldStretch = sum / n
+  end
+  if not freedAt and carOffset.z - groundZ > 0.05 then freedAt = reeled; stuckForce = 0 end
+  if os.getenv("ROPE_TRACE_REEL") and reeled % 10 == 0 then
+    local rid = next(ge.getRopes()); local r1, r2 = exts[1].getRope(rid), exts[2].getRope(rid)
+    print(string.format("reel %d car z %.3f vz %.2f hook z %.3f cable %.3f | load T %.0f st %.3f tu %.3f | hook T %.0f st %.3f tu %.3f",
+      reeled, carOffset.z - groundZ, carVel.z, pos[1][10].z, cableLength, r2.tension, r2.stretch or 0, r2.takeup or 0,
+      r1.tension, r1.stretch or 0, r1.takeup or 0))
+  end
+end
+check(freedAt ~= nil and maxTension > 100000, string.format("the stuck car was pulled free (%.0f kN on the ropes)", maxTension / 1000))
+check(heldStretch and heldStretch < 0.02, string.format("ropes hardly stretch holding that pull (%.1f mm)", (heldStretch or 0) * 1000))
 local lifted = carOffset.z - groundZ
 check(lifted > 1.0, string.format("reeling in lifts the car (%.2f m)", lifted))
 

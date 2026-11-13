@@ -70,6 +70,9 @@ local vehNodes = {
     {cid = 9, name = "roof", pos = vec3(0, 10, 1.4), cluster = 1},
     {cid = 10, name = "bumper", pos = vec3(0, 7.7, 0.5), cluster = 2},
     {cid = 11, name = "seat", pos = vec3(0, 10, 0.8), collision = false, cluster = 1},
+    -- front left wheel's hub (suspension, its own cluster): inner and outer axis nodes
+    {cid = 12, name = "fh1l", pos = vec3(0.7, 8.4, 0.3), cluster = 3},
+    {cid = 13, name = "fh2l", pos = vec3(0.95, 8.4, 0.3), cluster = 3},
   },
 }
 local massOf = {}
@@ -120,7 +123,8 @@ core_camera = {getPosition = function() return vec3(3, -5, 3) end}
 core_vehicle_manager = {getVehicleData = function(id)
   local nodes = {}
   for _, n in ipairs(vehNodes[id]) do nodes[n.cid] = n end
-  return {vdata = {nodes = nodes}}
+  local wheels = id == 2 and {[0] = {name = "FL", node1 = "fh1l", node2 = 13}} or nil
+  return {vdata = {nodes = nodes, wheels = wheels}}
 end}
 
 local mouseTarget = vec3(0, 0, 0)
@@ -224,11 +228,12 @@ check(drawn.text[#drawn.text]:find("Green hook") ~= nil, "hovering the green hoo
 ge.click()
 check(messages[#messages]:find("Green hook chosen") ~= nil, "green hook chosen")
 
--- Tow points: 8 secure points on the main body cluster, never the bumper, wheel or seat
+-- Tow points: 8 secure points on the main body cluster, never the bumper, wheel or seat, plus each wheel's centre
 local tps = ge.getTowPoints(2)
 local byLabel, tpCids = {}, {}
 for _, tp in ipairs(tps) do byLabel[tp.label] = tp.cid; tpCids[tp.cid] = true end
-check(#tps == 8, "8 tow points on the car (got " .. #tps .. ")")
+check(#tps == 9, "8 tow points on the car and one per wheel (got " .. #tps .. ")")
+check(byLabel["Front left wheel"] == 13, "the wheel's point is its outer hub node")
 check(byLabel["Front centre"] == 0 and byLabel["Rear centre"] == 2, "front and rear centre are the frame ends, not the bumper")
 check(byLabel["Front left"] == 4 and byLabel["Front right"] == 5, "front left/right follow the car's own left (+X here)")
 check(byLabel["Left side"] == 1 and byLabel["Right side"] == 8, "side points")

@@ -26,9 +26,12 @@ local progressStep = 0.05       -- m the hook must close to count as progress
 local hookPickRadius = 0.35
 local hookMarkerRadius = 0.18
 local nodeMarkerRadius = 0.08
-local ropeStiffness = 400000    -- N/m per rope (a 1.5 t car on 4 ropes stretches them about 1 cm)
-local ropeDamping = 20000       -- N per m/s of stretch rate (each end caps it to what its nodes can take)
-local ropeMaxTension = 250000   -- N per rope; tension is capped here, the rope doesn't break
+local ropeAxialStiffness = 4e6  -- N; spring stiffness per rope = this / length (a 4 m rope is 1,000 kN/m).
+                                -- Stiffer shakes heavy loads apart while positions arrive late; the rope
+                                -- takes up its stretch under a steady load instead (see the vehicle side)
+local ropeDamping = 50000       -- N per m/s of stretch rate (each end caps it to what its nodes can take)
+local ropeMaxTension = 1e6      -- N per rope; tension is capped here, the rope doesn't break
+local ropeHeavyTension = 250000 -- N per rope drawn fully red
 
 local hookLabels = {
   winch1_l55 = "Green hook",
@@ -128,6 +131,20 @@ local function buildCache(veh)
     -- centre node is not exactly the centroid, so pad by its offset as well
     c.radius = math.sqrt(radius2) + math.sqrt(bestCenter2) + 1.0
   end
+  -- each wheel's axis: node1 and node2 are the hub nodes the wheel turns about (they don't spin with it)
+  c.wheels = {}
+  local byName = {}
+  for _, node in pairs(nodes) do if node.name ~= nil and node.cid ~= nil then byName[node.name] = node.cid end end
+  for _, w in pairs(data.vdata.wheels or {}) do
+    if type(w) == "table" then
+      local n1 = type(w.node1) == "number" and w.node1 or byName[w.node1]
+      local n2 = type(w.node2) == "number" and w.node2 or byName[w.node2]
+      if n1 and n2 and n1 ~= n2 then
+        c.wheels[#c.wheels + 1] = {name = tostring(w.name or ""), node1 = n1, node2 = n2}
+      end
+    end
+  end
+  table.sort(c.wheels, function(a, b) return a.name < b.name end)
   return c
 end
 
@@ -231,7 +248,7 @@ local function addRope(hook, targetVeh, targetCid, targetLabel)
     targetId = targetId, targetCid = targetCid, targetLabel = targetLabel,
     length = length, tension = 0, dist = length,
   }
-  local args = string.format("%.4f,%.0f,%.0f,%.0f", length, ropeStiffness, ropeDamping, ropeMaxTension)
+  local args = string.format("%.4f,%.0f,%.0f,%.0f", length, ropeAxialStiffness, ropeDamping, ropeMaxTension)
   local hp, tp = nodeWorld(hookVeh, hook.cid), nodeWorld(targetVeh, targetCid)
   vehCmd(hook.vehId, string.format("ropeAdd(%d,%d,%s,1,%d,%.4f,%.4f,%.4f)", id, hook.cid, args, targetId, tp.x, tp.y, tp.z))
   vehCmd(targetId, string.format("ropeAdd(%d,%d,%s,0,%d,%.4f,%.4f,%.4f)", id, targetCid, args, hook.vehId, hp.x, hp.y, hp.z))
@@ -297,11 +314,19 @@ end
 -- non-wheel nodes in the same node cluster as the reference node, i.e. the main chassis/body shell and
 -- not separately breakable panels like bumpers and bonnets. A box is fitted to them and the node closest
 -- to each of 8 spots on it (front/rear corners and centre, each side, at about frame height) is used.
+-- Each wheel also gets one at its centre: the outer of its two hub nodes, which don't turn with the wheel.
 local towPointSpots = {
   {"front", -1, "left"}, {"front", -1, "centre"}, {"front", -1, "right"},
   {"rear", 1, "left"}, {"rear", 1, "centre"}, {"rear", 1, "right"},
   {"side", 0, "left"}, {"side", 0, "right"},
 }
+local wheelSides = {L = "left", R = "right"}
+local wheelEnds = {F = "Front", R = "Rear", M = "Middle"}
+local function wheelLabel(name)
+  local e, sd, rest = name:upper():match("^([FRM])([LR])(%w*)$")
+  if e then return wheelEnds[e] .. " " .. wheelSides[sd] .. (rest ~= "" and (" " .. rest) or "") .. " wheel" end
+  return "Wheel " .. name
+end
 local towPointRadius = 0.16
 local towPickRadius = 0.3
 
@@ -381,6 +406,16 @@ local function buildTowPoints(veh, c)
       points[#points + 1] = {cid = best, label = label}
     end
   end
+  for _, w in ipairs(c.wheels or {}) do
+    local p1, p2 = veh:getInitialNodePosition(w.node1), veh:getInitialNodePosition(w.node2)
+    if p1 and p2 then
+      local hub = math.abs(p1.x - cx) >= math.abs(p2.x - cx) and w.node1 or w.node2
+      if not used[hub] then
+        used[hub] = true
+        points[#points + 1] = {cid = hub, label = wheelLabel(w.name)}
+      end
+    end
+  end
   return points
 end
 
@@ -457,7 +492,7 @@ local function drawRopes()
       if (r.dist or 0) <= r.length then
         c = color(0.75, 0.75, 0.75, 0.9) -- slack
       else
-        local load = math.min((r.tension or 0) / ropeMaxTension, 1)
+        local load = math.min((r.tension or 0) / ropeHeavyTension, 1)
         c = color(0.2 + 0.8 * load, 1 - 0.7 * load, 0.2, 1)
       end
       debugDrawer:drawLine(a, b, c)
@@ -686,10 +721,12 @@ local function onUpdate(dtReal)
     if mode == "pickHook" then
       hovered = hook
     elseif mode == "pickTarget" then
-      if hook and hook.vehId == selectedHook.vehId and hook.cid == selectedHook.cid then
-        hovered = hook -- clicking the chosen hook again cancels
-      else
-        hovered = pickTowPoint(o.x, o.y, o.z, d.x, d.y, d.z)
+      -- Tow points win: the hook usually hangs right over the load, so the line of sight to a tow point
+      -- often passes near it. The chosen hook only counts (to finish or cancel) with no tow point under
+      -- the cursor.
+      hovered = pickTowPoint(o.x, o.y, o.z, d.x, d.y, d.z)
+      if not hovered and hook and hook.vehId == selectedHook.vehId and hook.cid == selectedHook.cid then
+        hovered = hook
       end
     end
   end

@@ -237,28 +237,38 @@ end
 -- Ropes ---------------------------------------------------------------------------------------------
 -- A rope joins a node on the hook's vehicle to a node on another vehicle (the load). It has a fixed length
 -- and only pulls: slack, it does nothing; stretched past its length, tension = stiffness * stretch +
--- damping * stretch rate. Both ends run this same code in their own vehicle and apply the tension to
--- their own end, so each vehicle feels the other.
+-- damping * stretch rate. It behaves like steel wire rope: stiffness = axial stiffness / length, so a
+-- short rope barely stretches at all. Both ends run this same code in their own vehicle and apply the
+-- tension to their own end, so each vehicle feels the other.
 --
 -- Each vehicle knows its own nodes exactly at physics rate (2 kHz), but hears where the other end is only
 -- once per graphics frame, and the frame rate isn't fixed: when the game loses focus it drops to a few
--- frames a second while physics carries on. The first version predicted the far end's motion between
--- frames and damped against its last reported velocity; across those long gaps that pumped energy into
--- the ropes and shook both vehicles apart. So each end treats the far end as fixed where it was last
--- reported: between reports it hangs on a spring and damper to a fixed point, which can only lose
--- energy. A little damping across the rope as well stops the load swinging up through the stale reports.
--- When a report is overdue (the frame rate has dropped) both dampings go up, so a heavy load can't build
--- up a bounce between reports. The two vehicles tell each other where their ends are directly, once per
--- frame.
+-- frames a second while physics carries on. The two vehicles tell each other where their ends are,
+-- directly, once per frame, and each end treats the far end as fixed where it was last reported. Predicting
+-- the far end's motion, or damping against its reported velocity, pumped energy into stiff ropes across
+-- those gaps and shook both vehicles apart; a spring and damper to a fixed point can only lose energy.
+--   Fresh report (normal frame rate): the damping works on this end's own velocity minus its slow-moving
+--   average, so a steady winch lift isn't dragged on, but ringing and bouncing are damped.
+--   Overdue report (the game lost focus): the damping works on this end's whole velocity and goes up, so a
+--   heavy load can't build up a bounce between reports.
+-- A little damping across the rope stops the load swinging up.
+--
+-- A spring stiff enough not to stretch visibly under a heavy pull shakes a heavy load apart across those
+-- delayed reports, so the spring is only moderately stiff, and the rope takes up its own stretch: under a
+-- steady load its rest length creeps in over about a second, until it is at its real length again. That
+-- slow correction stops while the reports are stale.
 local ropes = {}            -- rope id -> rope
 local ropeCount = 0
 local physicsHooked = false
 local sideDamping = 1500    -- N per m/s across each rope
-local staleAfter = 0.04     -- s without a report from the far end before the stale damping applies
+local staleAfter = 0.04     -- s without a report from the far end before it is held fixed
 local staleDampingFactor = 3  -- along the rope, times the normal damping
 local staleSideDamping = 6000 -- N per m/s across each rope
 local tensionReportInterval = 0.25
 local maxSpreadNodes = 8
+local slowVelocityTau = 0.3 -- s; this end's slow-moving velocity, which the damping leaves alone
+local takeupTau = 1         -- s; how fast a rope takes up its stretch under a steady load
+local maxTakeup = 0.3       -- m
 
 -- The nodes a rope end pulls on, with their masses. On the hook side, the hook body (so the hook moves as
 -- one piece); on the other side, the tow node and the nodes beamed straight to it, so a heavy load isn't
@@ -305,16 +315,17 @@ local function spreadNodes(cid, isHook)
   return list, mass
 end
 
--- id: rope id from GE; cid: this vehicle's end; length: rope length in m; isHook: 1 on the hook's vehicle;
--- farId: the other vehicle; x, y, z: where the far end is now.
--- How many ropes pull on each rope end node: the damping limit for a node is shared between them.
+-- How many ropes pull on each rope end node: the stability limits for a node are shared between them.
 local function recountShared()
   local perCid = {}
   for _, r in pairs(ropes) do perCid[r.cid] = (perCid[r.cid] or 0) + 1 end
   for _, r in pairs(ropes) do r.shared = perCid[r.cid] end
 end
 
-function M.ropeAdd(id, cid, length, stiffness, damping, maxTension, isHook, farId, x, y, z)
+-- id: rope id from GE; cid: this vehicle's end; length: rope length in m; axialStiffness: N (stiffness
+-- times length, like E*A for wire rope); isHook: 1 on the hook's vehicle; farId: the other vehicle;
+-- x, y, z: where the far end is now.
+function M.ropeAdd(id, cid, length, axialStiffness, damping, maxTension, isHook, farId, x, y, z)
   id, cid = tonumber(id), tonumber(cid)
   if not id or not cid or not v.data.nodes[cid] then return end
   if ropes[id] then ropeCount = ropeCount - 1 end
@@ -324,11 +335,11 @@ function M.ropeAdd(id, cid, length, stiffness, damping, maxTension, isHook, farI
     farId = tonumber(farId),
     cid = cid, nodes = nodes, mass = mass,
     length = tonumber(length) or 1,
-    stiffness = tonumber(stiffness) or 400000,
-    damping = tonumber(damping) or 20000,
-    maxTension = tonumber(maxTension) or 250000,
+    stiffness = (tonumber(axialStiffness) or 1.5e7) / math.max(tonumber(length) or 1, 0.5),
+    damping = tonumber(damping) or 50000,
+    maxTension = tonumber(maxTension) or 1e6,
     isHook = hookEnd,
-    tension = 0, reportTimer = 0,
+    tension = 0, reportTimer = 0, takeup = 0,
     rx = tonumber(x), ry = tonumber(y), rz = tonumber(z), -- the far end, as last reported
     age = 0,                                              -- s since the far end last reported
   }
@@ -338,15 +349,17 @@ function M.ropeAdd(id, cid, length, stiffness, damping, maxTension, isHook, farI
     enablePhysicsStepHook()
     physicsHooked = true
   end
-  log("I", logTag, string.format("rope %d %s end on node %d: %.2f m, %d nodes, %.1f kg", id, hookEnd and "hook" or "load",
-    cid, ropes[id].length, #nodes, mass))
+  log("I", logTag, string.format("rope %d %s end on node %d: %.2f m, %.0f kN/m, %d nodes, %.1f kg", id,
+    hookEnd and "hook" or "load", cid, ropes[id].length, ropes[id].stiffness / 1000, #nodes, mass))
 end
 
--- Where the far end of rope id is, in world coordinates. The other vehicle sends this every frame.
-function M.ropeRemote(id, x, y, z)
+-- Where the far end of rope id is, in world coordinates. The other vehicle sends this every frame, with
+-- how stretched the rope looks from the load end, or (to the load end) the hook end's take-up.
+function M.ropeRemote(id, x, y, z, extra)
   local r = ropes[tonumber(id)]
   if not r then return end
   r.rx, r.ry, r.rz = tonumber(x) or 0, tonumber(y) or 0, tonumber(z) or 0
+  if r.isHook then r.farStretch = tonumber(extra) else r.takeup = tonumber(extra) or r.takeup end
   r.age = 0
 end
 
@@ -373,29 +386,50 @@ function M.getRope(id) return ropes[tonumber(id)] end
 local function ropeStep(r, dt)
   r.age = r.age + dt
   if not r.rx then return end
+  local stale = r.age > staleAfter
+  local lv = obj:getNodeVelocityVector(r.cid)
+  -- this end's slow-moving velocity (a low-pass), kept up to date while slack too
+  local k = dt / (slowVelocityTau + dt)
+  if not r.svx then r.svx, r.svy, r.svz = lv.x, lv.y, lv.z end
+  r.svx = r.svx + (lv.x - r.svx) * k
+  r.svy = r.svy + (lv.y - r.svy) * k
+  r.svz = r.svz + (lv.z - r.svz) * k
   local lp = obj:getPosition() + obj:getNodePosition(r.cid)
   local dx, dy, dz = r.rx - lp.x, r.ry - lp.y, r.rz - lp.z
   local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-  if dist <= r.length or dist < 1e-3 then
+  r.stretch = dist - r.length
+  -- take up the stretch: the spring's rest length creeps in while the rope is stretched (and back out
+  -- while slack), so under a steady load the rope ends up at its real length. Each end sees the other
+  -- where it was a frame or two ago, so when both are moving one end sees the rope longer than it is and
+  -- the other shorter by the same amount: the take-up follows the average of the two, so a rope that is
+  -- only moving isn't wound in. The hook end works it out and tells the load end, so both pull the same.
+  if r.isHook and not stale and r.farStretch then
+    local stretch = (r.stretch + r.farStretch) * 0.5
+    r.takeup = math.max(0, math.min(r.takeup + stretch * dt / takeupTau, maxTakeup))
+  end
+  local length = r.length - r.takeup
+  if dist <= length or dist < 1e-3 then
     r.tension = 0
     return
   end
   dx, dy, dz = dx / dist, dy / dist, dz / dist
-  local lv = obj:getNodeVelocityVector(r.cid)
-  local along = lv.x * dx + lv.y * dy + lv.z * dz -- towards the far end
-  local stale = r.age > staleAfter
-  -- explicit integration: all the damping on these nodes must stay within what their mass can take in
-  -- one step, so the limit is shared between the ropes on this node (along and across are at right angles)
-  local maxDamping = 0.5 * r.mass / (dt * (r.shared or 1))
+  local ux, uy, uz = lv.x, lv.y, lv.z
+  if not stale then ux, uy, uz = lv.x - r.svx, lv.y - r.svy, lv.z - r.svz end
+  local along = ux * dx + uy * dy + uz * dz -- towards the far end
+  -- explicit integration: the spring and damping on these nodes must stay within what their mass can
+  -- take in one step, so the limits are shared between the ropes on this node
+  local shared = r.shared or 1
+  local maxDamping = 0.5 * r.mass / (dt * shared)
+  local stiffness = math.min(r.stiffness, 0.25 * r.mass / (dt * dt * shared))
   local damping = math.min(r.damping * (stale and staleDampingFactor or 1), maxDamping)
-  local t = r.stiffness * (dist - r.length) - damping * along
+  local t = stiffness * (dist - length) - damping * along
   if t < 0 then t = 0 elseif t > r.maxTension then t = r.maxTension end
   r.tension = t
   if t <= 0 then return end
   local c = math.min(stale and staleSideDamping or sideDamping, maxDamping)
-  local fx = dx * t - (lv.x - along * dx) * c
-  local fy = dy * t - (lv.y - along * dy) * c
-  local fz = dz * t - (lv.z - along * dz) * c
+  local fx = dx * t - (ux - along * dx) * c
+  local fy = dy * t - (uy - along * dy) * c
+  local fz = dz * t - (uz - along * dz) * c
   for _, n in ipairs(r.nodes) do
     local sh = n.share
     obj:applyForceVector(n.cid, vec3(fx * sh, fy * sh, fz * sh))
@@ -411,11 +445,11 @@ end
 -- GE for the markers.
 local function ropeReports(dt)
   for id, r in pairs(ropes) do
-    local p = obj:getPosition() + obj:getNodePosition(r.cid)
-    local x, y, z = p.x, p.y, p.z
     if r.farId then
+      local p = obj:getPosition() + obj:getNodePosition(r.cid)
       obj:queueObjectLuaCommand(r.farId, string.format(
-        "if extensions.xFpHookLink_vehicle then extensions.xFpHookLink_vehicle.ropeRemote(%d,%.4f,%.4f,%.4f) end", id, x, y, z))
+        "if extensions.xFpHookLink_vehicle then extensions.xFpHookLink_vehicle.ropeRemote(%d,%.4f,%.4f,%.4f,%.4f) end",
+        id, p.x, p.y, p.z, r.isHook and r.takeup or (r.stretch or 0)))
     end
     if r.isHook then
       r.reportTimer = r.reportTimer + dt
